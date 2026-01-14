@@ -8,6 +8,7 @@ const bot = new Telegraf(process.env.BOT_TOKEN || '');
 const dbHandler = new DBHandler();
 
 const liveMessages = new Map();
+const userStates = new Map();
 
 function formatTimeAgo(timestamp) {
     if (!timestamp) return 'N/A';
@@ -19,69 +20,58 @@ function formatTimeAgo(timestamp) {
     return `${Math.floor(seconds / 86400)}d ago`;
 }
 
-function formatRangeList(ranges, title) {
+function formatRangeList(ranges, title, includeTitle = false) {
     if (ranges.length === 0) {
-        return `${title}\n\nNo results found.`;
+        let msg = includeTitle ? `*${title}*\n\n` : '';
+        msg += 'No results found.';
+        return msg;
     }
 
-    let msg = `*${title}*\n\n`;
+    let msg = includeTitle ? `*${title}*\n\n` : '';
 
     ranges.forEach((r, i) => {
         const rank = `#${i + 1}`;
         const name = r.name;
-        const country = r.country;
         const timeAgo = formatTimeAgo(r.lastSeenTimestamp);
+        const clis = dbHandler.getTopClisForRange(name, 3);
 
         msg += `${rank} \`${name}\`\n`;
-        msg += `${country} | Calls: ${r.calls} | Last: ${timeAgo}\n\n`;
+        msg += `Calls: ${r.calls} | Last: ${timeAgo}\n`;
+
+        if (clis.length > 0) {
+            msg += clis.map(cli => `\`${cli}\``).join(' ') + '\n';
+        }
+
+        msg += '\n';
     });
 
-    return msg;
+    return msg.trim();
 }
 
-function getMainKeyboard() {
+function getStartKeyboard() {
     return Markup.inlineKeyboard([
         [
-            Markup.button.callback('Top 10', 'top'),
-            Markup.button.callback('Refresh', 'refresh')
+            Markup.button.callback('Live Ranges', 'live_ranges'),
+            Markup.button.callback('Search Keyword', 'search_prompt')
         ]
     ]);
 }
 
-async function sendOrUpdateMessage(ctx, text, isNew = false) {
-    try {
-        if (isNew) {
-            const msg = await ctx.reply(text, {
-                parse_mode: 'Markdown',
-                ...getMainKeyboard()
-            });
-            liveMessages.set(ctx.chat.id, { chatId: ctx.chat.id, messageId: msg.message_id });
-            return msg;
-        }
+function getRangeListKeyboard() {
+    return Markup.inlineKeyboard([
+        [Markup.button.callback('Back to Menu', 'back_menu')]
+    ]);
+}
 
-        const live = liveMessages.get(ctx.chat.id);
-        if (live) {
-            await bot.telegram.editMessageText(
-                live.chatId,
-                live.messageId,
-                undefined,
-                text,
-                {
-                    parse_mode: 'Markdown',
-                    ...getMainKeyboard()
-                }
-            );
-        }
-    } catch (e) {
-        if (e.description && e.description.includes('message is not modified')) {
-            return;
-        }
-    }
+function getSearchKeyboard() {
+    return Markup.inlineKeyboard([
+        [Markup.button.callback('Back to Menu', 'back_menu')]
+    ]);
 }
 
 async function updateLiveMessage(chatId) {
     const live = liveMessages.get(chatId);
-    if (!live) return;
+    if (!live || !live.showingList) return;
 
     try {
         let ranges;
@@ -92,10 +82,10 @@ async function updateLiveMessage(chatId) {
             title = `Search: "${live.keyword}"`;
         } else {
             ranges = dbHandler.getTopRanges(10);
-            title = `TOP 10 RANGES`;
+            title = '';
         }
 
-        const text = formatRangeList(ranges, title);
+        const text = formatRangeList(ranges, title, !!live.keyword);
 
         await bot.telegram.editMessageText(
             chatId,
@@ -104,7 +94,7 @@ async function updateLiveMessage(chatId) {
             text,
             {
                 parse_mode: 'Markdown',
-                ...getMainKeyboard()
+                ...getRangeListKeyboard()
             }
         );
     } catch (e) {
@@ -117,23 +107,77 @@ async function updateLiveMessage(chatId) {
 bot.start(async (ctx) => {
     try {
         dbHandler.initDB();
-        const text = formatRangeList(dbHandler.getTopRanges(10), 'TOP 10 RANGES');
-        await sendOrUpdateMessage(ctx, text, true);
+        userStates.delete(ctx.chat.id);
+        liveMessages.delete(ctx.chat.id);
+
+        await ctx.reply('Welcome! Choose an option:', getStartKeyboard());
     } catch (e) {
         await ctx.reply('Error starting bot. Please try again.');
     }
 });
 
+bot.action('live_ranges', async (ctx) => {
+    try {
+        userStates.delete(ctx.chat.id);
+        const ranges = dbHandler.getTopRanges(10);
+        const text = formatRangeList(ranges, '', false);
+
+        const msg = await ctx.reply(text, {
+            parse_mode: 'Markdown',
+            ...getRangeListKeyboard()
+        });
+
+        liveMessages.set(ctx.chat.id, {
+            chatId: ctx.chat.id,
+            messageId: msg.message_id,
+            showingList: true,
+            keyword: undefined
+        });
+
+        await ctx.answerCbQuery();
+    } catch (e) {
+        await ctx.answerCbQuery('Error');
+    }
+});
+
+bot.action('search_prompt', async (ctx) => {
+    try {
+        userStates.set(ctx.chat.id, { waitingForKeyword: true });
+        await ctx.reply('Enter the keyword to search:', getSearchKeyboard());
+        await ctx.answerCbQuery();
+    } catch (e) {
+        await ctx.answerCbQuery('Error');
+    }
+});
+
+bot.action('back_menu', async (ctx) => {
+    try {
+        userStates.delete(ctx.chat.id);
+        liveMessages.delete(ctx.chat.id);
+        await ctx.reply('Choose an option:', getStartKeyboard());
+        await ctx.answerCbQuery();
+    } catch (e) {
+        await ctx.answerCbQuery('Error');
+    }
+});
+
 bot.command('top', async (ctx) => {
     try {
-        const live = liveMessages.get(ctx.chat.id);
-        if (live) {
-            live.keyword = undefined;
-            await updateLiveMessage(ctx.chat.id);
-        } else {
-            const text = formatRangeList(dbHandler.getTopRanges(10), 'TOP 10 RANGES');
-            await sendOrUpdateMessage(ctx, text, true);
-        }
+        userStates.delete(ctx.chat.id);
+        const ranges = dbHandler.getTopRanges(10);
+        const text = formatRangeList(ranges, '', false);
+
+        const msg = await ctx.reply(text, {
+            parse_mode: 'Markdown',
+            ...getRangeListKeyboard()
+        });
+
+        liveMessages.set(ctx.chat.id, {
+            chatId: ctx.chat.id,
+            messageId: msg.message_id,
+            showingList: true,
+            keyword: undefined
+        });
     } catch (e) {
         await ctx.reply('Error fetching top ranges.');
     }
@@ -143,77 +187,71 @@ bot.command('search', async (ctx) => {
     try {
         const keyword = ctx.message.text.split(' ').slice(1).join(' ').trim();
         if (!keyword) {
-            await ctx.reply('Usage: /search <keyword>');
+            userStates.set(ctx.chat.id, { waitingForKeyword: true });
+            await ctx.reply('Enter the keyword to search:', getSearchKeyboard());
             return;
         }
 
+        userStates.delete(ctx.chat.id);
         const ranges = dbHandler.searchRanges(keyword, 10);
-        const text = formatRangeList(ranges, `Search: "${keyword}"`);
+        const text = formatRangeList(ranges, `Search: "${keyword}"`, true);
+
         const msg = await ctx.reply(text, {
             parse_mode: 'Markdown',
-            ...getMainKeyboard()
+            ...getRangeListKeyboard()
         });
-        liveMessages.set(ctx.chat.id, { chatId: ctx.chat.id, messageId: msg.message_id, keyword: keyword });
+
+        liveMessages.set(ctx.chat.id, {
+            chatId: ctx.chat.id,
+            messageId: msg.message_id,
+            showingList: true,
+            keyword: keyword
+        });
     } catch (e) {
         await ctx.reply('Error searching ranges.');
     }
 });
 
-bot.action('top', async (ctx) => {
-    try {
-        const live = liveMessages.get(ctx.chat.id);
-        if (live) {
-            live.keyword = undefined;
-        }
-        const ranges = dbHandler.getTopRanges(10);
-        const text = formatRangeList(ranges, 'TOP 10 RANGES');
-        await ctx.editMessageText(text, {
-            parse_mode: 'Markdown',
-            ...getMainKeyboard()
-        });
-        await ctx.answerCbQuery('Showing Top 10');
-    } catch (e) {
-        await ctx.answerCbQuery('Error');
-    }
-});
-
-bot.action('refresh', async (ctx) => {
-    try {
-        const live = liveMessages.get(ctx.chat.id);
-        let ranges;
-        let title;
-
-        if (live && live.keyword) {
-            ranges = dbHandler.searchRanges(live.keyword, 10);
-            title = `Search: "${live.keyword}"`;
-        } else {
-            ranges = dbHandler.getTopRanges(10);
-            title = 'TOP 10 RANGES';
-        }
-
-        const text = formatRangeList(ranges, title);
-        await ctx.editMessageText(text, {
-            parse_mode: 'Markdown',
-            ...getMainKeyboard()
-        });
-        await ctx.answerCbQuery('Refreshed');
-    } catch (e) {
-        await ctx.answerCbQuery('Error refreshing');
-    }
-});
-
 bot.on('text', async (ctx) => {
     try {
-        const keyword = ctx.message.text.trim();
-        if (keyword.startsWith('/')) return;
+        const text = ctx.message.text.trim();
+        if (text.startsWith('/')) return;
 
-        const ranges = dbHandler.searchRanges(keyword, 10);
-        const text = formatRangeList(ranges, `Search: "${keyword}"`);
-        const msg = await ctx.reply(text, {
-            parse_mode: 'Markdown',
-            ...getMainKeyboard()
-        });
-        liveMessages.set(ctx.chat.id, { chatId: ctx.chat.id, messageId: msg.message_id, keyword: keyword });
+        const state = userStates.get(ctx.chat.id);
+
+        if (state && state.waitingForKeyword) {
+            userStates.delete(ctx.chat.id);
+            const keyword = text;
+            const ranges = dbHandler.searchRanges(keyword, 10);
+            const msgText = formatRangeList(ranges, `Search: "${keyword}"`, true);
+
+            const msg = await ctx.reply(msgText, {
+                parse_mode: 'Markdown',
+                ...getRangeListKeyboard()
+            });
+
+            liveMessages.set(ctx.chat.id, {
+                chatId: ctx.chat.id,
+                messageId: msg.message_id,
+                showingList: true,
+                keyword: keyword
+            });
+        } else {
+            const ranges = dbHandler.searchRanges(text, 10);
+            const msgText = formatRangeList(ranges, `Search: "${text}"`, true);
+
+            const msg = await ctx.reply(msgText, {
+                parse_mode: 'Markdown',
+                ...getRangeListKeyboard()
+            });
+
+            liveMessages.set(ctx.chat.id, {
+                chatId: ctx.chat.id,
+                messageId: msg.message_id,
+                showingList: true,
+                keyword: text
+            });
+        }
     } catch (e) {
         await ctx.reply('Error processing your message.');
     }
@@ -261,4 +299,3 @@ export function getWebhookHandler() {
 if (import.meta.main) {
     main();
 }
-

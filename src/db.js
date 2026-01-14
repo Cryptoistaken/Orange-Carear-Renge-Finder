@@ -68,6 +68,15 @@ export class DBHandler {
         }
     }
 
+    getTopClisForRange(rangeName, limit = 3) {
+        try {
+            const rows = this.db.query('SELECT cli FROM clis WHERE range_name = ? LIMIT ?').all(rangeName, limit);
+            return rows.map(r => r.cli);
+        } catch (e) {
+            return [];
+        }
+    }
+
     processBatchTransaction(allFingerprints, fingerprintToRecordMap, rangeUpdates, clisToInsert, now) {
         try {
             this.db.exec('BEGIN TRANSACTION');

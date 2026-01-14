@@ -13,7 +13,7 @@ export const dbHandler = new DBHandler();
 const CONFIG = {
     SESSION: () => process.env.ORANGE_CARRIER_SESSION || '',
     CSRF: () => process.env.X_CSRF_TOKEN || '',
-    BATCH_SIZE: 25,
+    BATCH_SIZE: 50,
     DISPLAY_INTERVAL: 1000,
     REQUEST_TIMEOUT: 15000,
     BATCH_DELAY: 500,
