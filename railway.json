@@ -4,7 +4,7 @@
         "builder": "NIXPACKS"
     },
     "deploy": {
-        "startCommand": "bun run src/monitor.js",
+        "startCommand": "bun run src/index.js",
         "restartPolicyType": "ON_FAILURE",
         "restartPolicyMaxRetries": 10
     }

@@ -4,6 +4,7 @@
   "private": true,
   "scripts": {
     "start": "bun run src/monitor.js",
+    "start:all": "bun run src/index.js",
     "monitor": "bun run src/monitor.js",
     "bot": "bun run src/bot.js",
     "auth": "bun run src/auth.js"
