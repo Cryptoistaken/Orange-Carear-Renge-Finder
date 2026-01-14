@@ -111,37 +111,53 @@ function fetchPage(country) {
 }
 
 function updateDisplay() {
-    process.stdout.write('\x1b[2J\x1b[H');
+    const isInteractive = process.stdout.isTTY && !process.env.RAILWAY_ENVIRONMENT;
+
+    if (isInteractive) {
+        process.stdout.write('\x1b[2J\x1b[H');
+    }
 
     if (globalStats.isInitialPhase) {
-        console.log('INITIALIZING...');
-        console.log(`Progress: ${globalStats.initialProgress} / ${globalStats.totalCountries}`);
-        const countriesStr = globalStats.currentBatch.join(', ');
-        console.log(`Current: ${countriesStr.length > 60 ? countriesStr.substring(0, 57) + '...' : countriesStr}`);
-        console.log(`Records: ${globalStats.totalRecords}`);
+        if (isInteractive) {
+            console.log('INITIALIZING...');
+            console.log(`Progress: ${globalStats.initialProgress} / ${globalStats.totalCountries}`);
+            const countriesStr = globalStats.currentBatch.join(', ');
+            console.log(`Current: ${countriesStr.length > 60 ? countriesStr.substring(0, 57) + '...' : countriesStr}`);
+            console.log(`Records: ${globalStats.totalRecords}`);
+        } else {
+            // Log less frequently or just key milestones in non-interactive
+            if (globalStats.totalRequests % 50 === 0) {
+                console.log(`[Init] Progress: ${globalStats.initialProgress}/${globalStats.totalCountries} | Records: ${globalStats.totalRecords}`);
+            }
+        }
         return;
     }
 
     const sorted = dbHandler.getTopRanges(10);
 
-    console.log('TOP 10 RANGES');
-    console.log('-'.repeat(80));
-    console.log('RANK  RANGE                                   COUNTRY        CALLS   CLIS');
-    console.log('-'.repeat(80));
+    if (isInteractive) {
+        console.log('TOP 10 RANGES');
+        console.log('-'.repeat(80));
+        console.log('RANK  RANGE                                   COUNTRY        CALLS   CLIS');
+        console.log('-'.repeat(80));
 
-    sorted.forEach((r, i) => {
-        const rank = `#${i + 1}`;
-        const line =
-            rank.padEnd(6) +
-            (r.name.length > 38 ? r.name.substring(0, 35) + '...' : r.name).padEnd(40) +
-            (r.country.length > 12 ? r.country.substring(0, 9) + '...' : r.country).padEnd(15) +
-            String(r.calls).padEnd(8) +
-            String(r.clis);
-        console.log(line);
-    });
+        sorted.forEach((r, i) => {
+            const rank = `#${i + 1}`;
+            const line =
+                rank.padEnd(6) +
+                (r.name.length > 38 ? r.name.substring(0, 35) + '...' : r.name).padEnd(40) +
+                (r.country.length > 12 ? r.country.substring(0, 9) + '...' : r.country).padEnd(15) +
+                String(r.calls).padEnd(8) +
+                String(r.clis);
+            console.log(line);
+        });
 
-    console.log('-'.repeat(80));
-    console.log(`Requests: ${globalStats.totalRequests} | Records: ${globalStats.totalRecords}`);
+        console.log('-'.repeat(80));
+        console.log(`Requests: ${globalStats.totalRequests} | Records: ${globalStats.totalRecords}`);
+    } else {
+        // Simple log for non-interactive
+        console.log(`[Monitor] Req: ${globalStats.totalRequests} | Rec: ${globalStats.totalRecords} | Top: ${sorted.length > 0 ? sorted[0].name : 'None'}`);
+    }
 }
 
 async function processBatch(batch) {
