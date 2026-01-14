@@ -45,7 +45,11 @@ function formatRangeList(ranges, title, includeTitle = false) {
         msg += '\n';
     });
 
-    return msg.trim();
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString('en-US', { hour12: false });
+    msg += `_Updated: ${timeStr}_`;
+
+    return msg;
 }
 
 function getStartKeyboard() {
@@ -72,6 +76,11 @@ function getSearchKeyboard() {
 async function updateLiveMessage(chatId) {
     const live = liveMessages.get(chatId);
     if (!live || !live.showingList) return;
+
+    if (live.pauseUntil && Date.now() < live.pauseUntil) {
+        return;
+    }
+    live.pauseUntil = undefined;
 
     try {
         let ranges;
@@ -101,6 +110,16 @@ async function updateLiveMessage(chatId) {
         if (e.description && e.description.includes('message is not modified')) {
             return;
         }
+        if (e.description && e.description.includes('Too Many Requests')) {
+            const retryAfter = e.parameters?.retry_after || 5;
+            live.pauseUntil = Date.now() + (retryAfter * 1000);
+            return;
+        }
+        if (e.description && (e.description.includes('message to edit not found') || e.description.includes('message can\'t be edited'))) {
+            liveMessages.delete(chatId);
+            return;
+        }
+        console.error('Live update error:', e.description || e.message || e);
     }
 }
 
