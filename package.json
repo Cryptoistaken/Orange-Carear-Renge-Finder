@@ -3,11 +3,11 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "start": "bun run src/index.js",
-    "start:all": "bun run src/index.js",
-    "monitor": "bun run src/monitor.js",
-    "bot": "bun run src/bot.js",
-    "auth": "bun run src/auth.js"
+    "start": "DOTENV_CONFIG_QUIET=1 bun run src/index.js",
+    "start:all": "DOTENV_CONFIG_QUIET=1 bun run src/index.js",
+    "monitor": "DOTENV_CONFIG_QUIET=1 bun run src/monitor.js",
+    "bot": "DOTENV_CONFIG_QUIET=1 bun run src/bot.js",
+    "auth": "DOTENV_CONFIG_QUIET=1 bun run src/auth.js"
   },
   "devDependencies": {
     "@types/bun": "latest"

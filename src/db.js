@@ -20,6 +20,12 @@ export class DBHandler {
                     last_seen_timestamp INTEGER
                 );
             `);
+
+            try {
+                this.db.exec('ALTER TABLE ranges ADD COLUMN last_seen_timestamp INTEGER;');
+            } catch (e) {
+            }
+
             this.db.exec(`CREATE INDEX IF NOT EXISTS idx_ranges_sort ON ranges (calls DESC, clis_count DESC);`);
 
             this.db.exec(`
@@ -164,6 +170,7 @@ export class DBHandler {
             this.db.exec('COMMIT');
         } catch (e) {
             this.db.exec('ROLLBACK');
+            console.error('DB Transaction error:', e.message || e);
             throw e;
         }
     }

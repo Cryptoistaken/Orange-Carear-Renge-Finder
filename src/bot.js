@@ -2,7 +2,7 @@ import { Telegraf, Markup } from 'telegraf';
 import { DBHandler } from './db.js';
 import dotenv from 'dotenv';
 
-dotenv.config();
+dotenv.config({ debug: false });
 
 const bot = new Telegraf(process.env.BOT_TOKEN || '');
 const dbHandler = new DBHandler();
@@ -22,26 +22,26 @@ function formatTimeAgo(timestamp) {
 
 function formatRangeList(ranges, title, includeTitle = false) {
     if (ranges.length === 0) {
-        let msg = includeTitle ? `*${title}*\n\n` : '';
-        msg += 'No results found.';
-        return msg;
+        if (includeTitle && title) {
+            return `*${title}*\n\nNo results found. Try a different keyword.`;
+        }
+        return 'No results found.';
     }
 
     let msg = includeTitle ? `*${title}*\n\n` : '';
 
     ranges.forEach((r, i) => {
-        const rank = `#${i + 1}`;
         const name = r.name;
         const timeAgo = formatTimeAgo(r.lastSeenTimestamp);
         const clis = dbHandler.getTopClisForRange(name, 3);
+        const clisDisplay = clis.length > 0 ? clis.map(c => `\`${c}\``).join(', ') : 'N/A';
 
-        msg += `${rank} \`${name}\`\n`;
-        msg += `Calls: ${r.calls} | Last: ${timeAgo}\n`;
-
-        if (clis.length > 0) {
-            msg += clis.map(cli => `\`${cli}\``).join(' ') + '\n';
-        }
-
+        msg += `*#${i + 1}*\n`;
+        msg += `├─ Range: \`${name}\`\n`;
+        msg += `├─ Calls: ${r.calls}\n`;
+        msg += `├─ CLIs: ${r.clis || 0}\n`;
+        msg += `├─ Top CLIs: ${clisDisplay}\n`;
+        msg += `└─ Last: ${timeAgo}\n`;
         msg += '\n';
     });
 
@@ -253,6 +253,7 @@ bot.on('text', async (ctx) => {
             });
         }
     } catch (e) {
+        console.error('Text handler error:', e.message || e);
         await ctx.reply('Error processing your message.');
     }
 });

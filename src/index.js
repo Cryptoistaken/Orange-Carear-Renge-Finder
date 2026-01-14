@@ -1,4 +1,5 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
+dotenv.config({ debug: false });
 import http from 'http';
 import { main as monitorMain } from './monitor.js';
 import { main as botMain, getWebhookHandler } from './bot.js';

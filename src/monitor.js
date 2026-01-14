@@ -6,7 +6,7 @@ import dotenv from 'dotenv';
 import countries from 'i18n-iso-countries';
 import enLocale from 'i18n-iso-countries/langs/en.json';
 
-dotenv.config();
+dotenv.config({ debug: false });
 
 export const dbHandler = new DBHandler();
 
@@ -274,7 +274,9 @@ async function processBatch(batch) {
         dbHandler.processBatchTransaction(allFingerprints, fingerprintToRecordMap, rangeUpdates, clisToInsert, now);
 
     } catch (e) {
-        globalStats.statusMessage = 'Batch processing error';
+        const msg = e && e.message ? e.message : String(e);
+        globalStats.statusMessage = `Batch error: ${msg.substring(0, 50)}`;
+        console.error('Batch processing error:', msg);
     }
 }
 
