@@ -16,6 +16,7 @@
     "typescript": "^5"
   },
   "dependencies": {
+    "dotenv": "^17.2.3",
     "i18n-iso-countries": "^7.14.0",
     "playwright-core": "1.56.0",
     "puppeteer-core": "^24.34.0",
