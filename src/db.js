@@ -10,48 +10,51 @@ export class DBHandler {
     }
 
     initDB() {
-        this.db.exec(`
-            CREATE TABLE IF NOT EXISTS ranges (
-                name TEXT PRIMARY KEY,
-                country TEXT,
-                calls INTEGER DEFAULT 0,
-                clis_count INTEGER DEFAULT 0,
-                last_seen TEXT
-            );
-        `);
-        this.db.exec(`CREATE INDEX IF NOT EXISTS idx_ranges_sort ON ranges (calls DESC, clis_count DESC);`);
+        try {
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS ranges (
+                    name TEXT PRIMARY KEY,
+                    country TEXT,
+                    calls INTEGER DEFAULT 0,
+                    clis_count INTEGER DEFAULT 0,
+                    last_seen_timestamp INTEGER
+                );
+            `);
+            this.db.exec(`CREATE INDEX IF NOT EXISTS idx_ranges_sort ON ranges (calls DESC, clis_count DESC);`);
 
-        this.db.exec(`
-            CREATE TABLE IF NOT EXISTS clis (
-                range_name TEXT,
-                cli TEXT,
-                PRIMARY KEY (range_name, cli)
-            );
-        `);
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS clis (
+                    range_name TEXT,
+                    cli TEXT,
+                    PRIMARY KEY (range_name, cli)
+                );
+            `);
 
-        this.db.exec(`
-            CREATE TABLE IF NOT EXISTS calls_history (
-                id TEXT PRIMARY KEY,
-                created_at INTEGER
-            );
-        `);
+            this.db.exec(`
+                CREATE TABLE IF NOT EXISTS calls_history (
+                    id TEXT PRIMARY KEY,
+                    created_at INTEGER
+                );
+            `);
 
-        this.db.exec(`CREATE INDEX IF NOT EXISTS idx_history_created_at ON calls_history (created_at);`);
+            this.db.exec(`CREATE INDEX IF NOT EXISTS idx_history_created_at ON calls_history (created_at);`);
+        } catch (e) {
+            console.error('DB init error:', e.message);
+        }
     }
 
     cleanupOldData(retentionSeconds = 3600) {
-        const now = Math.floor(Date.now() / 1000);
-        const cutoff = now - retentionSeconds;
-
-        const result = this.db.prepare('DELETE FROM calls_history WHERE created_at < ?').run(cutoff);
-        if (result.changes > 0) {
-            console.log(`[Cleanup] Removed ${result.changes} old records`);
+        try {
+            const now = Math.floor(Date.now() / 1000);
+            const cutoff = now - retentionSeconds;
+            this.db.prepare('DELETE FROM calls_history WHERE created_at < ?').run(cutoff);
+        } catch (e) {
         }
     }
 
     getTopRanges(limit = 10) {
         try {
-            return this.db.query('SELECT name, country, calls, clis_count as clis, last_seen as lastSeen FROM ranges ORDER BY calls DESC, clis_count DESC LIMIT ?').all(limit);
+            return this.db.query('SELECT name, country, calls, clis_count as clis, last_seen_timestamp as lastSeenTimestamp FROM ranges ORDER BY calls DESC, clis_count DESC LIMIT ?').all(limit);
         } catch (e) {
             return [];
         }
@@ -59,7 +62,7 @@ export class DBHandler {
 
     searchRanges(keyword, limit = 10) {
         try {
-            return this.db.query('SELECT name, country, calls, clis_count as clis, last_seen as lastSeen FROM ranges WHERE name LIKE ? OR country LIKE ? ORDER BY calls DESC, clis_count DESC LIMIT ?').all(`%${keyword}%`, `%${keyword}%`, limit);
+            return this.db.query('SELECT name, country, calls, clis_count as clis, last_seen_timestamp as lastSeenTimestamp FROM ranges WHERE name LIKE ? OR country LIKE ? ORDER BY calls DESC, clis_count DESC LIMIT ?').all(`%${keyword}%`, `%${keyword}%`, limit);
         } catch (e) {
             return [];
         }
@@ -102,11 +105,14 @@ export class DBHandler {
                             country: country,
                             calls: 0,
                             newClis: 0,
-                            lastSeen: rec.timeStr
+                            lastSeenTimestamp: rec.timestamp
                         });
                     }
                     const update = rangeUpdates.get(rec.range);
                     update.calls++;
+                    if (rec.timestamp > (update.lastSeenTimestamp || 0)) {
+                        update.lastSeenTimestamp = rec.timestamp;
+                    }
                 }
             }
 
@@ -127,14 +133,15 @@ export class DBHandler {
             if (rangeUpdates.size > 0) {
                 const updates = Array.from(rangeUpdates.values());
                 for (const u of updates) {
-                    const existing = this.db.query('SELECT calls FROM ranges WHERE name = ?').get(u.name);
+                    const existing = this.db.query('SELECT calls, last_seen_timestamp FROM ranges WHERE name = ?').get(u.name);
 
                     if (existing) {
-                        this.db.prepare('UPDATE ranges SET calls = calls + ?, last_seen = ? WHERE name = ?')
-                            .run(u.calls, u.lastSeen, u.name);
+                        const newTimestamp = Math.max(existing.last_seen_timestamp || 0, u.lastSeenTimestamp || 0);
+                        this.db.prepare('UPDATE ranges SET calls = calls + ?, last_seen_timestamp = ? WHERE name = ?')
+                            .run(u.calls, newTimestamp, u.name);
                     } else {
-                        this.db.prepare('INSERT INTO ranges (name, country, calls, clis_count, last_seen) VALUES (?, ?, ?, 0, ?)')
-                            .run(u.name, u.country, u.calls, u.lastSeen);
+                        this.db.prepare('INSERT INTO ranges (name, country, calls, clis_count, last_seen_timestamp) VALUES (?, ?, ?, 0, ?)')
+                            .run(u.name, u.country, u.calls, u.lastSeenTimestamp);
                     }
                 }
 
@@ -153,5 +160,4 @@ export class DBHandler {
     }
 }
 
-// Export a singleton instance for other modules
 export const dbHandler = new DBHandler();

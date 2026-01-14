@@ -7,7 +7,7 @@ const BROWSERLESS_API_KEY = process.env.BROWSERLESS_API_KEY || '2Tl8dA0AoBjpxtPe
 const USE_BROWSERLESS = process.env.USE_BROWSERLESS === 'true' || !!process.env.RAILWAY_ENVIRONMENT;
 
 async function loginWithPuppeteer() {
-    console.log('Connecting to Browserless.io...');
+    console.log('Connecting to Browserless...');
 
     const browser = await puppeteer.connect({
         browserWSEndpoint: `wss://production-sfo.browserless.io?token=${BROWSERLESS_API_KEY}`,
@@ -179,12 +179,12 @@ export async function login() {
         envContent = updateEnvVar(envContent, 'ORANGE_CARRIER_SESSION', sessionCookie);
 
         fs.writeFileSync(envPath, envContent);
-        console.log('Saved tokens to .env');
+        console.log('Tokens saved');
 
         return tokens;
 
     } catch (error) {
-        console.log('Error: ' + error.message);
+        console.error('Login error:', error.message);
         throw error;
     }
 }
