@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import { main as monitorMain } from './monitor.js';
 import { main as botMain } from './bot.js';
 
