@@ -1,10 +1,8 @@
 import dotenv from 'dotenv';
-dotenv.config({ debug: false });
+dotenv.config({ debug: false, quiet: true });
 import http from 'http';
 import { main as monitorMain } from './monitor.js';
 import { main as botMain, getWebhookHandler } from './bot.js';
-
-console.log('Starting Orange Carrier Range Finder...');
 
 const isRailway = !!process.env.RAILWAY_ENVIRONMENT;
 
@@ -39,4 +37,3 @@ if (isRailway) {
         process.exit(1);
     });
 }
-

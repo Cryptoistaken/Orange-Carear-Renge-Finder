@@ -1,11 +1,14 @@
 import { Telegraf, Markup } from 'telegraf';
-import { DBHandler } from './db.js';
+import { dbHandler, globalStats } from './monitor.js';
 import dotenv from 'dotenv';
 
-dotenv.config({ debug: false });
+dotenv.config({ debug: false, quiet: true });
 
-const bot = new Telegraf(process.env.BOT_TOKEN || '');
-const dbHandler = new DBHandler();
+if (!process.env.BOT_TOKEN) {
+    throw new Error('BOT_TOKEN environment variable is required');
+}
+
+const bot = new Telegraf(process.env.BOT_TOKEN);
 
 const liveMessages = new Map();
 const userStates = new Map();
@@ -32,24 +35,71 @@ function formatRangeList(ranges, title, includeTitle = false) {
 
     ranges.forEach((r, i) => {
         const name = r.name;
-        const timeAgo = formatTimeAgo(r.lastSeenTimestamp);
+        const absoluteTime = new Date(r.lastSeenTimestamp).toLocaleTimeString('en-US', {
+            timeZone: 'Asia/Dhaka',
+            hour12: true,
+            hour: 'numeric',
+            minute: 'numeric',
+            second: 'numeric'
+        });
+
+        // Calculate relative time
+        const diffSec = Math.floor((Date.now() - r.lastSeenTimestamp) / 1000);
+        let relativeTime;
+        if (diffSec < 60) {
+            relativeTime = `${diffSec}s`;
+        } else if (diffSec < 3600) {
+            const mins = Math.floor(diffSec / 60);
+            const secs = diffSec % 60;
+            relativeTime = `${mins}m ${secs}s`;
+        } else {
+            const hrs = Math.floor(diffSec / 3600);
+            const mins = Math.floor((diffSec % 3600) / 60);
+            relativeTime = `${hrs}h ${mins}m`;
+        }
+
         const clis = dbHandler.getTopClisForRange(name, 3);
         const clisDisplay = clis.length > 0 ? clis.map(c => `\`${c}\``).join(', ') : 'N/A';
 
         msg += `*#${i + 1}*\n`;
         msg += `├─ Range: \`${name}\`\n`;
         msg += `├─ Calls: ${r.calls}\n`;
-        msg += `├─ CLIs: ${r.clis || 0}\n`;
-        msg += `├─ Top CLIs: ${clisDisplay}\n`;
-        msg += `└─ Last: ${timeAgo}\n`;
+        msg += `├─ CLI: ${r.clis || 0}\n`;
+        msg += `├─ Latest CLIs: ${clisDisplay}\n`;
+        msg += `└─ Last: ${absoluteTime}  ${relativeTime} ago\n`;
         msg += '\n';
     });
 
     const now = new Date();
-    const timeStr = now.toLocaleTimeString('en-US', { hour12: false });
+    const timeStr = now.toLocaleTimeString('en-US', { timeZone: 'Asia/Dhaka', hour12: true, hour: 'numeric', minute: 'numeric', second: 'numeric' });
     msg += `_Updated: ${timeStr}_`;
 
     return msg;
+}
+
+function getInitMessage() {
+    const progress = `${globalStats.initialProgress}/${globalStats.totalCountries}`;
+    const now = new Date();
+    const timeStr = now.toLocaleTimeString('en-US', { timeZone: 'Asia/Dhaka', hour12: true, hour: 'numeric', minute: 'numeric', second: 'numeric' });
+    return `*Initializing...*\n\nFetching data from all countries.\nProgress: ${progress}\nRecords so far: ${globalStats.totalRecords}\n\n_Updated: ${timeStr}_`;
+}
+
+function getDisplayText(keyword = undefined) {
+    if (globalStats.isInitialPhase) {
+        return getInitMessage();
+    }
+
+    let ranges;
+    let title;
+
+    if (keyword) {
+        ranges = dbHandler.searchRanges(keyword, 10);
+        title = `Search: "${keyword}"`;
+        return formatRangeList(ranges, title, true);
+    } else {
+        ranges = dbHandler.getTopRanges(10);
+        return formatRangeList(ranges, '', false);
+    }
 }
 
 function getStartKeyboard() {
@@ -77,24 +127,18 @@ async function updateLiveMessage(chatId) {
     const live = liveMessages.get(chatId);
     if (!live || !live.showingList) return;
 
+    // Prevent concurrent updates for the same chat
+    if (live.updating) return;
+    live.updating = true;
+
     if (live.pauseUntil && Date.now() < live.pauseUntil) {
+        live.updating = false;
         return;
     }
     live.pauseUntil = undefined;
 
     try {
-        let ranges;
-        let title;
-
-        if (live.keyword) {
-            ranges = dbHandler.searchRanges(live.keyword, 10);
-            title = `Search: "${live.keyword}"`;
-        } else {
-            ranges = dbHandler.getTopRanges(10);
-            title = '';
-        }
-
-        const text = formatRangeList(ranges, title, !!live.keyword);
+        const text = getDisplayText(live.keyword);
 
         await bot.telegram.editMessageText(
             chatId,
@@ -108,29 +152,32 @@ async function updateLiveMessage(chatId) {
         );
     } catch (e) {
         if (e.description && e.description.includes('message is not modified')) {
-            return;
-        }
-        if (e.description && e.description.includes('Too Many Requests')) {
+            // This is okay, content hasn't changed
+        } else if (e.description && e.description.includes('Too Many Requests')) {
             const retryAfter = e.parameters?.retry_after || 5;
             live.pauseUntil = Date.now() + (retryAfter * 1000);
-            return;
-        }
-        if (e.description && (e.description.includes('message to edit not found') || e.description.includes('message can\'t be edited'))) {
+        } else if (e.description && (e.description.includes('message to edit not found') || e.description.includes("message can't be edited"))) {
             liveMessages.delete(chatId);
-            return;
+        } else {
+            console.error('Live update error:', e.description || e.message || e);
         }
-        console.error('Live update error:', e.description || e.message || e);
+    } finally {
+        // Always release the lock
+        const currentLive = liveMessages.get(chatId);
+        if (currentLive) {
+            currentLive.updating = false;
+        }
     }
 }
 
 bot.start(async (ctx) => {
     try {
-        dbHandler.initDB();
         userStates.delete(ctx.chat.id);
         liveMessages.delete(ctx.chat.id);
 
         await ctx.reply('Welcome! Choose an option:', getStartKeyboard());
     } catch (e) {
+        console.error('Start command error:', e.message || e);
         await ctx.reply('Error starting bot. Please try again.');
     }
 });
@@ -138,8 +185,7 @@ bot.start(async (ctx) => {
 bot.action('live_ranges', async (ctx) => {
     try {
         userStates.delete(ctx.chat.id);
-        const ranges = dbHandler.getTopRanges(10);
-        const text = formatRangeList(ranges, '', false);
+        const text = getDisplayText();
 
         const msg = await ctx.reply(text, {
             parse_mode: 'Markdown',
@@ -183,8 +229,7 @@ bot.action('back_menu', async (ctx) => {
 bot.command('top', async (ctx) => {
     try {
         userStates.delete(ctx.chat.id);
-        const ranges = dbHandler.getTopRanges(10);
-        const text = formatRangeList(ranges, '', false);
+        const text = getDisplayText();
 
         const msg = await ctx.reply(text, {
             parse_mode: 'Markdown',
@@ -212,8 +257,7 @@ bot.command('search', async (ctx) => {
         }
 
         userStates.delete(ctx.chat.id);
-        const ranges = dbHandler.searchRanges(keyword, 10);
-        const text = formatRangeList(ranges, `Search: "${keyword}"`, true);
+        const text = getDisplayText(keyword);
 
         const msg = await ctx.reply(text, {
             parse_mode: 'Markdown',
@@ -241,8 +285,7 @@ bot.on('text', async (ctx) => {
         if (state && state.waitingForKeyword) {
             userStates.delete(ctx.chat.id);
             const keyword = text;
-            const ranges = dbHandler.searchRanges(keyword, 10);
-            const msgText = formatRangeList(ranges, `Search: "${keyword}"`, true);
+            const msgText = getDisplayText(keyword);
 
             const msg = await ctx.reply(msgText, {
                 parse_mode: 'Markdown',
@@ -256,8 +299,7 @@ bot.on('text', async (ctx) => {
                 keyword: keyword
             });
         } else {
-            const ranges = dbHandler.searchRanges(text, 10);
-            const msgText = formatRangeList(ranges, `Search: "${text}"`, true);
+            const msgText = getDisplayText(text);
 
             const msg = await ctx.reply(msgText, {
                 parse_mode: 'Markdown',
@@ -277,11 +319,21 @@ bot.on('text', async (ctx) => {
     }
 });
 
-setInterval(() => {
-    for (const chatId of liveMessages.keys()) {
-        updateLiveMessage(chatId);
+// Use recursive setTimeout instead of setInterval for reliable sequencing
+async function runUpdateCycle() {
+    const chatIds = Array.from(liveMessages.keys());
+
+    for (const chatId of chatIds) {
+        try {
+            await updateLiveMessage(chatId);
+        } catch (err) {
+            console.error('Update error for chat', chatId, ':', err.message || err);
+        }
     }
-}, 1000);
+
+    // Schedule next update after 1 second
+    setTimeout(runUpdateCycle, 1000);
+}
 
 bot.catch((err) => {
     const msg = err && err.message ? err.message : String(err);
@@ -302,6 +354,9 @@ export async function main() {
             });
             console.log('Bot started (polling)');
         }
+
+        // Start the update cycle after bot is initialized
+        setTimeout(runUpdateCycle, 1000);
 
         process.once('SIGINT', () => bot.stop('SIGINT'));
         process.once('SIGTERM', () => bot.stop('SIGTERM'));

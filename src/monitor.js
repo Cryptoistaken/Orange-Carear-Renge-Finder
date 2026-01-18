@@ -6,7 +6,7 @@ import dotenv from 'dotenv';
 import countries from 'i18n-iso-countries';
 import enLocale from 'i18n-iso-countries/langs/en.json';
 
-dotenv.config({ debug: false });
+dotenv.config({ debug: false, quiet: true });
 
 export const dbHandler = new DBHandler();
 
@@ -21,6 +21,9 @@ const CONFIG = {
     TOKEN_REFRESH_INTERVAL: 110 * 60 * 1000,
     ZERO_THRESHOLD: 10
 };
+
+let refreshPromise = null;
+
 
 const BLACKLIST_PATH = './database/blacklist_country.json';
 let blacklist = new Set();
@@ -78,15 +81,69 @@ function checkAndBlacklist(country, recordCount, wasAuthError) {
 }
 
 async function refreshTokens() {
-    try {
-        globalStats.statusMessage = 'Refreshing tokens...';
-        await login();
-        dotenv.config({ override: true });
-        globalStats.statusMessage = 'Tokens refreshed';
-        globalStats.lastAuthError = false;
-    } catch (e) {
-        globalStats.statusMessage = 'Login failed';
-    }
+    if (refreshPromise) return refreshPromise;
+
+    refreshPromise = (async () => {
+        try {
+            globalStats.statusMessage = 'Refreshing tokens...';
+            await login();
+            globalStats.statusMessage = 'Tokens refreshed';
+            globalStats.lastAuthError = false;
+            scheduleNextRefresh();
+            return true;
+        } catch (e) {
+            globalStats.statusMessage = 'Login failed';
+            console.error('Refresh token failed:', e);
+            throw e;
+        } finally {
+            refreshPromise = null;
+        }
+    })();
+
+    return refreshPromise;
+}
+
+let refreshTimeout = null;
+
+function scheduleNextRefresh() {
+    if (refreshTimeout) clearTimeout(refreshTimeout);
+
+    const lastRefresh = parseInt(process.env.LAST_TOKEN_REFRESH || '0');
+    const now = Date.now();
+    const elapsed = now - lastRefresh;
+    const remaining = CONFIG.TOKEN_REFRESH_INTERVAL - elapsed;
+
+    const delay = remaining > 0 ? remaining : 1000;
+
+    console.log(`[Scheduler] Last refresh: ${new Date(lastRefresh).toISOString()}, Next refresh in ${Math.round(delay / 60000)} minutes`);
+
+    refreshTimeout = setTimeout(async () => {
+        globalStats.statusMessage = 'Scheduled token refresh...';
+
+        const maxRetries = 3;
+        const baseDelay = 30000; // 30 seconds
+
+        for (let attempt = 1; attempt <= maxRetries; attempt++) {
+            try {
+                await refreshTokens();
+                return; // Success, exit
+            } catch (e) {
+                console.error(`Scheduled refresh attempt ${attempt}/${maxRetries} failed:`, e.message);
+                globalStats.statusMessage = `Refresh failed (attempt ${attempt}/${maxRetries})`;
+
+                if (attempt < maxRetries) {
+                    const retryDelay = baseDelay * Math.pow(2, attempt - 1);
+                    console.log(`Retrying in ${retryDelay / 1000}s...`);
+                    await new Promise(resolve => setTimeout(resolve, retryDelay));
+                } else {
+                    console.error('All refresh attempts failed. Will retry in 5 minutes.');
+                    globalStats.statusMessage = 'Refresh failed. Retrying in 5m...';
+                    // Schedule a retry in 5 minutes
+                    setTimeout(() => scheduleNextRefresh(), 5 * 60 * 1000);
+                }
+            }
+        }
+    }, delay);
 }
 
 function parseTimeSeconds(timeStr) {
@@ -104,7 +161,7 @@ function parseTimeSeconds(timeStr) {
 }
 
 function fetchPage(country) {
-    return new Promise((resolve) => {
+    const fetchPromise = new Promise((resolve) => {
         const body = `q=${encodeURIComponent(country)}`;
         const options = {
             hostname: 'www.orangecarrier.com',
@@ -120,12 +177,22 @@ function fetchPage(country) {
             }
         };
 
+        let resolved = false;
+        const safeResolve = (value) => {
+            if (!resolved) {
+                resolved = true;
+                resolve(value);
+            }
+        };
+
         const req = https.request(options, (res) => {
             if (res.statusCode === 401 || res.statusCode === 403 || (res.statusCode === 302 && res.headers.location && res.headers.location.includes('login'))) {
                 globalStats.statusMessage = `Session Expired (${res.statusCode}). Refreshing...`;
                 globalStats.lastAuthError = true;
                 res.resume();
-                refreshTokens().then(() => resolve({ records: [], authError: true }));
+                refreshTokens()
+                    .then(() => safeResolve({ records: [], authError: true, refreshed: true }))
+                    .catch(() => safeResolve({ records: [], authError: true, refreshed: false }));
                 return;
             }
 
@@ -135,8 +202,12 @@ function fetchPage(country) {
                 if (data.includes('Log in to Your IPRN Account') || data.includes('login-form')) {
                     globalStats.statusMessage = 'Login form detected. Refreshing...';
                     globalStats.lastAuthError = true;
-                    await refreshTokens();
-                    resolve({ records: [], authError: true });
+                    try {
+                        await refreshTokens();
+                        safeResolve({ records: [], authError: true, refreshed: true });
+                    } catch (e) {
+                        safeResolve({ records: [], authError: true, refreshed: false });
+                    }
                     return;
                 }
 
@@ -157,34 +228,92 @@ function fetchPage(country) {
                     }
                 }
 
-                resolve({ records, authError: false });
+                safeResolve({ records, authError: false });
             });
+
+            res.on('error', () => safeResolve({ records: [], authError: false }));
         });
 
-        req.on('error', () => resolve({ records: [], authError: false }));
+        req.on('error', () => safeResolve({ records: [], authError: false }));
         req.setTimeout(CONFIG.REQUEST_TIMEOUT, () => {
             req.destroy();
-            resolve({ records: [], authError: false });
+            safeResolve({ records: [], authError: false });
         });
         req.write(body);
         req.end();
     });
+
+    // Wrap with a hard timeout to prevent any hanging
+    const timeoutPromise = new Promise((resolve) => {
+        setTimeout(() => {
+            resolve({ records: [], authError: false });
+        }, CONFIG.REQUEST_TIMEOUT + 5000);
+    });
+
+    return Promise.race([fetchPromise, timeoutPromise]);
 }
 
 let displayInitialized = false;
 const DISPLAY_LINES = 17;
 
+function formatDhakaTime(timestamp) {
+    if (!timestamp) return 'N/A';
+    const absoluteTime = new Date(timestamp).toLocaleTimeString('en-US', {
+        timeZone: 'Asia/Dhaka',
+        hour12: true,
+        hour: 'numeric',
+        minute: 'numeric',
+        second: 'numeric'
+    });
+
+    // Calculate relative time
+    const diffSec = Math.floor((Date.now() - timestamp) / 1000);
+    let relativeTime;
+    if (diffSec < 60) {
+        relativeTime = `${diffSec}s`;
+    } else if (diffSec < 3600) {
+        const mins = Math.floor(diffSec / 60);
+        const secs = diffSec % 60;
+        relativeTime = `${mins}m ${secs}s`;
+    } else {
+        const hrs = Math.floor(diffSec / 3600);
+        const mins = Math.floor((diffSec % 3600) / 60);
+        relativeTime = `${hrs}h ${mins}m`;
+    }
+
+    return `${absoluteTime} ${relativeTime}`;
+}
+
 function updateDisplay() {
     const isInteractive = process.stdout.isTTY && !process.env.RAILWAY_ENVIRONMENT;
 
+    // ANSI color codes
+    const C = {
+        reset: '\x1b[0m',
+        bold: '\x1b[1m',
+        dim: '\x1b[2m',
+        cyan: '\x1b[36m',
+        green: '\x1b[32m',
+        yellow: '\x1b[33m',
+        magenta: '\x1b[35m',
+        white: '\x1b[97m',
+        gray: '\x1b[90m',
+        bgBlue: '\x1b[44m',
+        orange: '\x1b[38;5;208m'
+    };
+
     if (globalStats.isInitialPhase) {
-        const progress = `${globalStats.initialProgress}/${globalStats.totalCountries}`;
-        const line = `[Init] ${progress} | Records: ${globalStats.totalRecords} | ${globalStats.statusMessage}`;
+        const pct = globalStats.totalCountries > 0 ? Math.floor((globalStats.initialProgress / globalStats.totalCountries) * 100) : 0;
+        const barLen = 30;
+        const filled = Math.floor((pct / 100) * barLen);
+        const bar = `${C.orange}${'█'.repeat(filled)}${C.gray}${'░'.repeat(barLen - filled)}${C.reset}`;
+
+        const line = `${C.cyan}[INIT]${C.reset} ${bar} ${C.white}${pct}%${C.reset} ${C.dim}|${C.reset} ${C.green}${globalStats.totalRecords}${C.reset} records ${C.dim}|${C.reset} ${C.yellow}${globalStats.statusMessage}${C.reset}`;
         if (isInteractive) {
-            process.stdout.write(`\r${line.padEnd(100)}`);
+            process.stdout.write(`\r${line}\x1b[K`);
         } else {
             if (globalStats.totalRequests % 50 === 0) {
-                console.log(line);
+                console.log(`[Init] ${globalStats.initialProgress}/${globalStats.totalCountries} | Records: ${globalStats.totalRecords}`);
             }
         }
         return;
@@ -194,37 +323,51 @@ function updateDisplay() {
 
     if (isInteractive) {
         if (!displayInitialized) {
-            process.stdout.write('\x1b[2J\x1b[H');
+            process.stdout.write('\x1b[2J\x1b[H\x1b[?25l'); // Clear + hide cursor
             displayInitialized = true;
         }
 
         process.stdout.write('\x1b[H');
 
         const lines = [];
-        lines.push('TOP 10 RANGES'.padEnd(80));
-        lines.push('-'.repeat(80));
-        lines.push('RANK  RANGE                                   COUNTRY        CALLS   LAST    ');
-        lines.push('-'.repeat(80));
+
+        // Header
+        lines.push('');
+        lines.push(`  ${C.bold}${C.orange}ORANGE CARRIER RANGE FINDER${C.reset}`);
+        lines.push(`  ${C.dim}${'─'.repeat(70)}${C.reset}`);
+        lines.push('');
+
+        // Column headers
+        lines.push(`  ${C.dim}#${C.reset}   ${C.cyan}RANGE${C.reset}                                 ${C.cyan}CALLS${C.reset}  ${C.cyan}CLI${C.reset}  ${C.cyan}LAST SEEN${C.reset}`);
+        lines.push(`  ${C.dim}${'─'.repeat(70)}${C.reset}`);
 
         for (let i = 0; i < 10; i++) {
             if (sorted[i]) {
                 const r = sorted[i];
-                const rank = `#${i + 1}`;
-                const line =
-                    rank.padEnd(6) +
-                    (r.name.length > 38 ? r.name.substring(0, 35) + '...' : r.name).padEnd(40) +
-                    (r.country.length > 12 ? r.country.substring(0, 9) + '...' : r.country).padEnd(15) +
-                    String(r.calls).padEnd(8) +
-                    (r.lastSeen || 'N/A').padEnd(20);
-                lines.push(line);
+                const rankColor = i === 0 ? C.orange : i < 3 ? C.yellow : C.gray;
+                const rank = `${rankColor}${String(i + 1).padStart(2)}${C.reset}`;
+                const name = (r.name.length > 35 ? r.name.substring(0, 32) + '...' : r.name).padEnd(38);
+                const calls = `${C.green}${String(r.calls).padStart(5)}${C.reset}`;
+                const clis = `${C.magenta}${String(r.clis).padStart(4)}${C.reset}`;
+
+                const diffSec = r.lastSeenTimestamp ? Math.floor((Date.now() - r.lastSeenTimestamp) / 1000) : 999999;
+                let timeColor = diffSec < 30 ? C.green : diffSec < 120 ? C.yellow : C.dim;
+                let timeStr = diffSec < 60 ? `${diffSec}s` : diffSec < 3600 ? `${Math.floor(diffSec / 60)}m` : `${Math.floor(diffSec / 3600)}h`;
+                const lastSeen = `${timeColor}${timeStr.padStart(8)}${C.reset}`;
+
+                lines.push(`  ${rank}  ${C.white}${name}${C.reset} ${calls}  ${clis}  ${lastSeen}`);
             } else {
-                lines.push(' '.repeat(80));
+                lines.push('');
             }
         }
 
-        lines.push('-'.repeat(80));
-        lines.push(`Requests: ${globalStats.totalRequests} | Records: ${globalStats.totalRecords} | Blacklisted: ${blacklist.size}`.padEnd(80));
-        lines.push(`Status: ${globalStats.statusMessage}`.padEnd(80));
+        lines.push(`  ${C.dim}${'─'.repeat(70)}${C.reset}`);
+
+        // Stats footer
+        const statsLine = `  ${C.dim}Requests:${C.reset} ${C.cyan}${globalStats.totalRequests}${C.reset}  ${C.dim}Records:${C.reset} ${C.green}${globalStats.totalRecords}${C.reset}  ${C.dim}Blacklisted:${C.reset} ${C.yellow}${blacklist.size}${C.reset}`;
+        lines.push(statsLine);
+        lines.push(`  ${C.dim}Status:${C.reset} ${C.white}${globalStats.statusMessage}${C.reset}`);
+        lines.push('');
 
         process.stdout.write(lines.join('\n') + '\x1b[K');
     } else {
@@ -246,6 +389,7 @@ async function processBatch(batch) {
         const fingerprintToRecordMap = new Map();
         const rangeUpdates = new Map();
         const clisToInsert = [];
+        const allRangeTimestamps = new Map(); // Track latest timestamp for ALL records
 
         for (const res of results) {
             checkAndBlacklist(res.country, res.records.length, res.authError);
@@ -260,6 +404,11 @@ async function processBatch(batch) {
 
                     rec.timestamp = timestamp;
 
+                    // Always track the latest timestamp for this range (for display)
+                    if (!allRangeTimestamps.has(rec.range) || timestamp > allRangeTimestamps.get(rec.range)) {
+                        allRangeTimestamps.set(rec.range, timestamp);
+                    }
+
                     const fingerprint = `${rec.range}|${rec.call}|${rec.cli}|${timeBucket}`;
 
                     if (!fingerprintToRecordMap.has(fingerprint)) {
@@ -271,7 +420,7 @@ async function processBatch(batch) {
             }
         }
 
-        dbHandler.processBatchTransaction(allFingerprints, fingerprintToRecordMap, rangeUpdates, clisToInsert, now);
+        dbHandler.processBatchTransaction(allFingerprints, fingerprintToRecordMap, rangeUpdates, clisToInsert, now, allRangeTimestamps);
 
     } catch (e) {
         const msg = e && e.message ? e.message : String(e);
@@ -282,10 +431,14 @@ async function processBatch(batch) {
 
 export async function main() {
     loadBlacklist();
+    dbHandler.wipeDB();
     dbHandler.initDB();
 
     if (!CONFIG.SESSION() || !CONFIG.CSRF()) {
         await refreshTokens();
+    } else {
+        // We have tokens, just schedule the next refresh
+        scheduleNextRefresh();
     }
 
     const allNames = countries.getNames('en', { select: 'official' });
@@ -295,13 +448,8 @@ export async function main() {
     setInterval(updateDisplay, CONFIG.DISPLAY_INTERVAL);
 
     setInterval(() => {
-        dbHandler.cleanupOldData();
+        dbHandler.cleanupOldData(300);
     }, CONFIG.CLEANUP_INTERVAL);
-
-    setInterval(async () => {
-        globalStats.statusMessage = 'Scheduled token refresh...';
-        await refreshTokens();
-    }, CONFIG.TOKEN_REFRESH_INTERVAL);
 
     for (let i = 0; i < countryList.length; i += CONFIG.BATCH_SIZE) {
         const batch = countryList.slice(i, i + CONFIG.BATCH_SIZE);

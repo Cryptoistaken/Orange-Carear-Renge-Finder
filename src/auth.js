@@ -3,8 +3,12 @@ import { chromium } from 'playwright-core';
 import fs from 'fs';
 import path from 'path';
 
-const BROWSERLESS_API_KEY = process.env.BROWSERLESS_API_KEY || '2Tl8dA0AoBjpxtPee97a830d14a013a06f640ce1e383f9afc';
 const USE_BROWSERLESS = process.env.USE_BROWSERLESS === 'true' || !!process.env.RAILWAY_ENVIRONMENT;
+const BROWSERLESS_API_KEY = process.env.BROWSERLESS_API_KEY;
+
+if (USE_BROWSERLESS && !BROWSERLESS_API_KEY) {
+    throw new Error('BROWSERLESS_API_KEY environment variable is required when using Browserless');
+}
 
 async function loginWithPuppeteer() {
     console.log('Connecting to Browserless...');
@@ -100,6 +104,10 @@ async function loginWithPlaywright() {
     });
     const page = await context.newPage();
 
+    // Set default navigation timeout
+    page.setDefaultNavigationTimeout(60000);
+    page.setDefaultTimeout(60000);
+
     let csrfToken = '';
     let sessionCookie = '';
 
@@ -116,12 +124,21 @@ async function loginWithPlaywright() {
             }
         });
 
-        await page.goto('https://www.orangecarrier.com/login');
-        await page.waitForSelector('text=Log in to Your IPRN Account');
+        await page.goto('https://www.orangecarrier.com/login', {
+            waitUntil: 'domcontentloaded',
+            timeout: 60000
+        });
+        await page.waitForSelector('text=Log in to Your IPRN Account', { timeout: 30000 });
 
         await page.getByRole('link', { name: 'Test Account' }).click();
 
-        await page.goto('https://www.orangecarrier.com/testaccount/services/cli/access');
+        // Wait for navigation after clicking Test Account
+        await page.waitForLoadState('domcontentloaded');
+
+        await page.goto('https://www.orangecarrier.com/testaccount/services/cli/access', {
+            waitUntil: 'domcontentloaded',
+            timeout: 60000
+        });
 
         await page.addStyleTag({ content: '.popup-message { display: none !important; }' });
 
@@ -130,11 +147,14 @@ async function loginWithPlaywright() {
             el.dispatchEvent(new Event('input', { bubbles: true }));
         });
 
-        const responsePromise = page.waitForResponse(resp => resp.url().includes('/testaccount/services/cli/access/get'));
+        const responsePromise = page.waitForResponse(
+            resp => resp.url().includes('/testaccount/services/cli/access/get'),
+            { timeout: 60000 }
+        );
         await page.locator('button:has-text("Search")').evaluate(el => el.click());
         await responsePromise;
 
-        await page.waitForSelector('th:has-text("Termination")');
+        await page.waitForSelector('th:has-text("Termination")', { timeout: 60000 });
 
         const cookies = await context.cookies();
         const sessionCookieObj = cookies.find(c => c.name === 'orange_carrier_session');
@@ -177,8 +197,22 @@ export async function login() {
 
         envContent = updateEnvVar(envContent, 'X_CSRF_TOKEN', csrfToken);
         envContent = updateEnvVar(envContent, 'ORANGE_CARRIER_SESSION', sessionCookie);
+        const ts = Date.now().toString();
+        envContent = updateEnvVar(envContent, 'LAST_TOKEN_REFRESH', ts);
 
-        fs.writeFileSync(envPath, envContent);
+        // Write file first, then update process.env only on success
+        try {
+            fs.writeFileSync(envPath, envContent);
+        } catch (writeError) {
+            console.error('Failed to write env file:', writeError.message);
+            throw writeError;
+        }
+
+        // Update process.env only after file write succeeds
+        process.env.X_CSRF_TOKEN = csrfToken;
+        process.env.ORANGE_CARRIER_SESSION = sessionCookie;
+        process.env.LAST_TOKEN_REFRESH = ts;
+
         console.log('Tokens saved');
 
         return tokens;
