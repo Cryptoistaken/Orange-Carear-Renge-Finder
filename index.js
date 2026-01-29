@@ -30,11 +30,13 @@ const CONFIG = {
 };
 
 
-// Database setup
+// Database setup - NO UNIQUE CONSTRAINT
 const db = new sqlite3.Database('dedup.db');
 
 db.serialize(() => {
-    db.run("CREATE TABLE IF NOT EXISTS seen_records (id INTEGER PRIMARY KEY AUTOINCREMENT, range TEXT, cli TEXT, timestamp INTEGER, UNIQUE(range, cli))");
+    db.run("CREATE TABLE IF NOT EXISTS seen_records (id INTEGER PRIMARY KEY AUTOINCREMENT, range TEXT, cli TEXT, timestamp INTEGER)");
+    db.run("CREATE INDEX IF NOT EXISTS idx_range_timestamp ON seen_records(range, timestamp)");
+    db.run("CREATE INDEX IF NOT EXISTS idx_timestamp ON seen_records(timestamp)");
 });
 
 function dbRun(sql, params = []) {
@@ -63,10 +65,10 @@ const liveMessages = new Map();
 const globalStats = {
     totalRequests: 0,
     totalRecords: 0,
-    isInitialPhase: true,
     initialProgress: 0,
     totalCountries: 0,
-    statusMessage: 'System Active'
+    statusMessage: 'System Active',
+    botStatus: 'Initializing...'
 };
 
 countries.registerLocale(enLocale);
@@ -293,17 +295,19 @@ function fetchPage(country) {
                 }
 
                 const records = [];
-                const regex = /<tr>\s*<td>(.*?)<\/td>\s*<td>(.*?)<\/td>\s*<td>.*?<\/td>\s*<td>(.*?)<\/td>\s*<td>.*?<\/td>\s*<td>(.*?)<\/td>/g;
+                const regex = /<tr>\s*<td>(.*?)<\/td>\s*<td>(.*?)<\/td>\s*<td>.*?<\/td>\s*<td>.*?<\/td>\s*<td>.*?<\/td>\s*<td>(.*?)<\/td>/g;
                 let match;
                 while ((match = regex.exec(data)) !== null) {
-                    const timeStr = (match[4] || '').trim();
+                    const range = (match[1] || '').trim();
+                    const cli = (match[2] || '').trim();
+                    const timeStr = (match[3] || '').trim();
                     const age = parseTimeSeconds(timeStr);
 
                     if (age <= 300) {
                         records.push({
-                            range: (match[1] || '').trim(),
-                            call: (match[2] || '').trim(),
-                            cli: (match[3] || '').trim(),
+                            range: range,
+                            call: cli,
+                            cli: cli,
                             timeStr: timeStr,
                             timestamp: Date.now() - (age * 1000)
                         });
@@ -334,115 +338,121 @@ function fetchPage(country) {
     return Promise.race([fetchPromise, timeoutPromise]);
 }
 
-// Leaderboard management
-// Changed to store individual records for rolling window calculation
+// Leaderboard management - Deduplicate by range+cli combination
 async function updateLeaderboard(records) {
     const now = Date.now();
-    const cliMap = new Map();
+    const cutoff = now - (CONFIG.DATA_RETENTION * 1000);
 
-    // Start transaction for batch inserts
-    try {
-        await dbRun("BEGIN TRANSACTION");
-
-        for (const rec of records) {
-            // Check if record exists in DB (deduplication)
-            try {
-                await dbRun("INSERT INTO seen_records (range, cli, timestamp) VALUES (?, ?, ?)", [rec.range, rec.cli, rec.timestamp]);
-            } catch (e) {
-                if (e.code === 'SQLITE_CONSTRAINT') {
-                    // Duplicate found, skip
-                    continue;
-                }
-                console.error('DB Insert Error:', e.message);
-                continue;
-            }
-
-            // Add to leaderboard (store individual records)
-            if (!leaderboard.has(rec.range)) {
-                leaderboard.set(rec.range, {
-                    name: rec.range,
-                    callRecords: [], // Store individual records with timestamps
-                    recentClis: []
-                });
-            }
-
-            const entry = leaderboard.get(rec.range);
-            entry.callRecords.push({ cli: rec.cli, timestamp: rec.timestamp });
-
-            const key = `${rec.range}|${rec.cli}`;
-            if (!cliMap.has(key) || rec.timestamp > cliMap.get(key)) {
-                cliMap.set(key, rec.timestamp);
-            }
+    // Deduplicate incoming records by range+cli
+    const uniqueRecords = new Map();
+    for (const rec of records) {
+        const key = `${rec.range}|${rec.cli}`;
+        if (!uniqueRecords.has(key) || rec.timestamp > uniqueRecords.get(key).timestamp) {
+            uniqueRecords.set(key, rec);
         }
-
-        await dbRun("COMMIT");
-
-    } catch (e) {
-        console.error('Transaction Error:', e.message);
-        try { await dbRun("ROLLBACK"); } catch (err) { }
     }
 
-    // Update recent CLIs
-    for (const [key, timestamp] of cliMap.entries()) {
-        const [range, cli] = key.split('|');
-        const entry = leaderboard.get(range);
-        if (entry) {
-            entry.recentClis = entry.recentClis.filter(item => item.cli !== cli);
-            entry.recentClis.push({ cli, timestamp });
+    // Update leaderboard
+    for (const rec of uniqueRecords.values()) {
+        // Create entry if it doesn't exist
+        if (!leaderboard.has(rec.range)) {
+            leaderboard.set(rec.range, {
+                name: rec.range,
+                uniqueCalls: new Map(),
+                recentClis: []
+            });
+        }
+
+        const entry = leaderboard.get(rec.range);
+
+        // Add this CLI to the map (or update timestamp if newer)
+        const existingTimestamp = entry.uniqueCalls.get(rec.cli);
+        if (!existingTimestamp || rec.timestamp > existingTimestamp) {
+            entry.uniqueCalls.set(rec.cli, rec.timestamp);
+
+            // Update recent CLIs display list
+            entry.recentClis = entry.recentClis.filter(item => item.cli !== rec.cli);
+            entry.recentClis.push({ cli: rec.cli, timestamp: rec.timestamp });
             entry.recentClis.sort((a, b) => b.timestamp - a.timestamp);
             entry.recentClis = entry.recentClis.slice(0, 3);
         }
     }
 
-    // Cleanup old records from leaderboard (older than 5 minutes)
-    const cutoff = now - (CONFIG.DATA_RETENTION * 1000);
+    // Clean up expired entries
     for (const [name, entry] of leaderboard.entries()) {
-        // Filter out old call records
-        entry.callRecords = entry.callRecords.filter(r => r.timestamp >= cutoff);
+        // Remove expired CLIs from the map
+        for (const [cli, timestamp] of entry.uniqueCalls.entries()) {
+            if (timestamp < cutoff) {
+                entry.uniqueCalls.delete(cli);
+            }
+        }
+
+        // Clean up recent CLIs list
         entry.recentClis = entry.recentClis.filter(r => r.timestamp >= cutoff);
 
-        // Remove entry if no recent calls
-        if (entry.callRecords.length === 0) {
+        // Remove range if no active CLIs
+        if (entry.uniqueCalls.size === 0) {
             leaderboard.delete(name);
         }
     }
 
-    // Cleanup DB (keep last 10k records)
-    try {
-        const countRow = await dbGet("SELECT COUNT(*) as count FROM seen_records");
-        if (countRow && countRow.count > 10000) {
-            await dbRun("DELETE FROM seen_records WHERE id NOT IN (SELECT id FROM seen_records ORDER BY timestamp DESC LIMIT 10000)");
+    // Optional: Database persistence (can be removed for pure in-memory)
+    for (const rec of uniqueRecords.values()) {
+        try {
+            await dbRun(
+                "INSERT OR REPLACE INTO seen_records (range, cli, timestamp) VALUES (?, ?, ?)",
+                [rec.range, rec.cli, rec.timestamp]
+            );
+        } catch (e) {
+            // Ignore DB errors
         }
-    } catch (e) {
-        console.error('DB Cleanup Error:', e.message);
+    }
+
+    // Periodic cleanup
+    if (Math.random() < 0.01) {
+        try {
+            const countRow = await dbGet("SELECT COUNT(*) as count FROM seen_records");
+            if (countRow && countRow.count > 50000) {
+                await dbRun("DELETE FROM seen_records WHERE id NOT IN (SELECT id FROM seen_records ORDER BY timestamp DESC LIMIT 50000)");
+            }
+        } catch (e) {
+            // Ignore
+        }
     }
 }
 
 function getTopRanges(limit = 10) {
     const now = Date.now();
-    const cutoff = now - (CONFIG.DATA_RETENTION * 1000); // 5 minutes
+    const cutoff = now - (CONFIG.DATA_RETENTION * 1000);
 
     return Array.from(leaderboard.values())
         .map(entry => {
-            // Only count records from the last 5 minutes
-            const recentRecords = entry.callRecords.filter(r => r.timestamp >= cutoff);
-            const uniqueClis = new Set(recentRecords.map(r => r.cli));
-            const lastRecord = recentRecords.length > 0
-                ? recentRecords.reduce((a, b) => a.timestamp > b.timestamp ? a : b)
-                : null;
+            // Count active CLIs (within time window)
+            const activeClis = new Map();
+            for (const [cli, timestamp] of entry.uniqueCalls.entries()) {
+                if (timestamp >= cutoff) {
+                    activeClis.set(cli, timestamp);
+                }
+            }
+
+            const lastTimestamp = activeClis.size > 0
+                ? Math.max(...activeClis.values())
+                : 0;
 
             return {
                 name: entry.name,
-                calls: recentRecords.length,
-                clis: uniqueClis.size,
-                lastSeenTimestamp: lastRecord ? lastRecord.timestamp : 0,
-                recentClis: entry.recentClis.filter(r => r.timestamp >= cutoff).map(item => item.cli)
+                calls: activeClis.size,
+                clis: activeClis.size,
+                lastSeenTimestamp: lastTimestamp,
+                recentClis: entry.recentClis
+                    .filter(r => r.timestamp >= cutoff)
+                    .map(item => item.cli)
             };
         })
-        .filter(entry => entry.calls > 0) // Only show entries with recent calls
+        .filter(entry => entry.calls > 0)
         .sort((a, b) => {
             if (b.calls !== a.calls) return b.calls - a.calls;
-            return b.clis - a.clis;
+            return b.lastSeenTimestamp - a.lastSeenTimestamp;
         })
         .slice(0, limit);
 }
@@ -457,6 +467,7 @@ function updateDisplay() {
         reset: '\x1b[0m',
         bold: '\x1b[1m',
         dim: '\x1b[2m',
+        red: '\x1b[31m',
         cyan: '\x1b[36m',
         green: '\x1b[32m',
         yellow: '\x1b[33m',
@@ -527,7 +538,7 @@ function updateDisplay() {
 
         const statsLine = `  ${C.dim}Requests:${C.reset} ${C.cyan}${globalStats.totalRequests}${C.reset}  ${C.dim}Records:${C.reset} ${C.green}${globalStats.totalRecords}${C.reset}`;
         lines.push(statsLine);
-        lines.push(`  ${C.dim}Status:${C.reset} ${C.white}${globalStats.statusMessage}${C.reset}`);
+        lines.push(`  ${C.dim}Status:${C.reset} ${C.white}${globalStats.statusMessage.padEnd(20)}${C.reset}  ${C.dim}Bot:${C.reset} ${globalStats.botStatus === 'Online' ? C.green : C.red}${globalStats.botStatus.padEnd(20)}${C.reset}`);
         lines.push('');
 
         process.stdout.write(lines.join('\n') + '\x1b[K');
@@ -873,6 +884,14 @@ async function monitorMain() {
             index++;
         }
         await processBatch(batch);
+        if (globalStats.totalRequests % 100 === 0) {
+            const topRange = Array.from(leaderboard.values())
+                .sort((a, b) => b.uniqueCalls.size - a.uniqueCalls.size)[0];
+            if (topRange) {
+                console.log(`Debug: Top range has ${topRange.uniqueCalls.size} unique CLIs`);
+            }
+        }
+        await new Promise(resolve => setTimeout(resolve, CONFIG.BATCH_DELAY));
     }
 }
 
@@ -882,10 +901,22 @@ async function botMain() {
             const webhookDomain = 'orangecarrier.up.railway.app';
             await bot.telegram.setWebhook(`https://${webhookDomain}/webhook`);
             console.log('Bot webhook set:', webhookDomain);
+            globalStats.botStatus = 'Online (Webhook)';
         } else {
-            await bot.launch({
+            // Verify connection first
+            const me = await bot.telegram.getMe();
+            console.log(`Bot connected: ${me.username}`);
+
+            // Start polling without awaiting (it blocks until stop)
+            bot.launch({
                 dropPendingUpdates: true
+            }).catch(e => {
+                console.error('Bot polling error:', e.message);
+                globalStats.botStatus = 'Failed';
+                fs.writeFileSync('bot_error.log', `Polling Error: ${e.message}\n${e.stack}`);
             });
+
+            globalStats.botStatus = 'Online';
             console.log('Bot started (polling)');
         }
 
@@ -896,6 +927,8 @@ async function botMain() {
     } catch (e) {
         const msg = e && e.message ? e.message : String(e);
         console.error('Failed to start bot:', msg);
+        fs.writeFileSync('bot_error.log', msg + '\n' + (e.stack || ''));
+        globalStats.botStatus = 'Failed';
         throw e;
     }
 }
@@ -927,7 +960,9 @@ if (isRailway) {
 } else {
     Promise.all([
         monitorMain().catch(err => console.error('Monitor error:', err.message)),
-        botMain().catch(err => console.error('Bot error:', err.message))
+        new Promise(resolve => setTimeout(resolve, 5000)).then(() =>
+            botMain().catch(err => console.error('Bot error:', err.message))
+        )
     ]).catch(err => {
         console.error('Fatal error:', err.message);
         process.exit(1);
