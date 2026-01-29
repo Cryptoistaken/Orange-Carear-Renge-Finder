@@ -1,25 +1,16 @@
 {
-  "name": "orange-range-finder",
-  "type": "module",
-  "private": true,
+  "name": "orange-carrier-monitor",
+  "version": "1.0.0",
+  "description": "Orange Carrier Range Finder with Telegram Bot",
+  "main": "index.js",
   "scripts": {
-    "start": "DOTENV_CONFIG_QUIET=1 bun run src/index.js",
-    "start:all": "DOTENV_CONFIG_QUIET=1 bun run src/index.js",
-    "monitor": "DOTENV_CONFIG_QUIET=1 bun run src/monitor.js",
-    "bot": "DOTENV_CONFIG_QUIET=1 bun run src/bot.js",
-    "auth": "DOTENV_CONFIG_QUIET=1 bun run src/auth.js"
-  },
-  "devDependencies": {
-    "@types/bun": "latest"
-  },
-  "peerDependencies": {
-    "typescript": "^5"
+    "start": "node index.js"
   },
   "dependencies": {
     "dotenv": "^17.2.3",
-    "i18n-iso-countries": "^7.14.0",
-    "playwright-core": "1.56.0",
-    "puppeteer-core": "^24.34.0",
+    "i18n-iso-countries": "^7.12.0",
+    "puppeteer-core": "^23.11.1",
+    "sqlite3": "^5.1.7",
     "telegraf": "^4.16.3"
   }
 }
